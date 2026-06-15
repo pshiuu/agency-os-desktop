@@ -27,6 +27,11 @@ point it at their own Agency OS server; end users never need build tools.
     `target="_blank"` / `window.open(...)`, and `on_navigation` sends anything that
     isn't an in-app `/agency-os` page (the ERPNext desk `/app/...`, file/PDF
     downloads, websites) to the browser;
+  - **native macOS notifications** — `NOTIFY_JS` watches the SPA's
+    `notifications.get_notifications` responses (refetched on the realtime
+    `notification` socket event) and posts new unread items to Notification
+    Center via the sentinel → `tauri-plugin-notification`. No SPA changes needed;
+    the first notification may prompt for permission.
   - **auto-updates** from GitHub Releases (see below).
 
 ## Build a `.app` + `.dmg` locally (for dev/testing)

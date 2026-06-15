@@ -3,8 +3,16 @@ use std::path::PathBuf;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
+
+// One native notification, as emitted by NOTIFY_JS (title `t`, body `b`).
+#[derive(serde::Deserialize)]
+struct NotifyItem {
+    t: String,
+    b: String,
+}
 
 // Open `target="_blank"` links and `window.open(...)` calls in the system browser
 // instead of inside the app. The remote page can't call Rust directly, so the
@@ -33,6 +41,75 @@ const LINK_INTERCEPT_JS: &str = r#"
   window.open = function (url) {
     if (url) ext(url);
     return null;
+  };
+})();
+"#;
+
+// Post a native macOS notification when a new unread Agency OS notification
+// arrives. We wrap fetch and watch the `notifications.get_notifications` response
+// (refetched whenever the realtime `notification` socket event fires). New unread
+// items are funnelled to Rust through a sentinel navigation (same trick as the
+// link handler) which shows them in Notification Center. No SPA changes needed.
+const NOTIFY_JS: &str = r#"
+(function () {
+  var seen = new Set();
+  var primed = false;
+
+  function strip(html) {
+    var d = document.createElement("div");
+    d.innerHTML = html || "";
+    return (d.textContent || d.innerText || "").replace(/\s+/g, " ").trim();
+  }
+
+  function handle(json) {
+    var list =
+      (json && json.message && json.message.notifications) ||
+      (json && json.notifications);
+    if (!Array.isArray(list)) return;
+
+    var fresh = [];
+    for (var i = 0; i < list.length; i++) {
+      var n = list[i];
+      if (!n || !n.name) continue;
+      var isNew = !seen.has(n.name);
+      seen.add(n.name);
+      if (primed && isNew && !n.read) {
+        var body = strip(n.subject);
+        if (body) fresh.push({ t: "Agency OS", b: body });
+      }
+    }
+    // First response just records the backlog so we don't notify old items.
+    if (!primed) {
+      primed = true;
+      return;
+    }
+    if (fresh.length) {
+      try {
+        var payload = encodeURIComponent(JSON.stringify(fresh.slice(0, 5)));
+        window.location.href = "https://notify.agencyos.invalid/?n=" + payload;
+      } catch (e) {}
+    }
+  }
+
+  var origFetch = window.fetch;
+  window.fetch = function () {
+    var args = arguments;
+    return origFetch.apply(this, args).then(function (res) {
+      try {
+        var url = (args[0] && args[0].url) || args[0];
+        if (
+          typeof url === "string" &&
+          url.indexOf("notifications.get_notifications") !== -1
+        ) {
+          res
+            .clone()
+            .json()
+            .then(handle)
+            .catch(function () {});
+        }
+      } catch (e) {}
+      return res;
+    });
   };
 })();
 "#;
@@ -180,6 +257,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             get_server_url,
             set_server_url,
@@ -280,7 +358,29 @@ pub fn run() {
                 .min_inner_size(800.0, 600.0)
                 .center()
                 .initialization_script(LINK_INTERCEPT_JS)
+                .initialization_script(NOTIFY_JS)
                 .on_navigation(move |url| {
+                    // Sentinel emitted by NOTIFY_JS: post the new notifications to
+                    // macOS Notification Center, and cancel the in-app navigation.
+                    if url.host_str() == Some("notify.agencyos.invalid") {
+                        if let Some(raw) = url
+                            .query_pairs()
+                            .find(|(k, _)| k.as_ref() == "n")
+                            .map(|(_, v)| v.into_owned())
+                        {
+                            if let Ok(items) = serde_json::from_str::<Vec<NotifyItem>>(&raw) {
+                                for item in items {
+                                    let _ = handle
+                                        .notification()
+                                        .builder()
+                                        .title(item.t)
+                                        .body(item.b)
+                                        .show();
+                                }
+                            }
+                        }
+                        return false;
+                    }
                     // Sentinel emitted by LINK_INTERCEPT_JS: open the wrapped URL
                     // in the system browser, and cancel the in-app navigation.
                     if url.host_str() == Some("ext.agencyos.invalid") {
