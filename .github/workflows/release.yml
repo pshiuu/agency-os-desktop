@@ -1,0 +1,52 @@
+name: Release
+
+# Push a version tag (e.g. v0.1.1) to build, sign, and publish a GitHub Release.
+# Existing installs then auto-update from it. Keep the tag in sync with the
+# `version` in src-tauri/tauri.conf.json.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build, sign, and publish the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Agency OS ${{ github.ref_name }}"
+          releaseBody: "Download the .dmg below to install. Existing installs update automatically."
+          releaseDraft: false
+          prerelease: false
+          # Universal binary so the same download runs on Apple Silicon and Intel Macs.
+          args: --target universal-apple-darwin

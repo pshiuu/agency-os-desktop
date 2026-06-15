@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agency OS</title>
+    <script type="module" src="/main.js" defer></script>
+  </head>
+
+  <body>
+    <main class="screen">
+      <section id="setup" class="card" hidden>
+        <img class="logo" src="/assets/agency-os-logo.svg" alt="Agency OS" />
+        <h1>Agency OS</h1>
+        <p class="subtitle">Connect to your server</p>
+
+        <form id="connect-form" autocomplete="off">
+          <input
+            id="server-input"
+            type="url"
+            spellcheck="false"
+            autocapitalize="off"
+            placeholder="https://agencyos.yourcompany.com"
+          />
+          <button id="connect-btn" type="submit">Connect</button>
+        </form>
+
+        <p id="error" class="error" role="alert"></p>
+        <a id="forget" href="#" class="forget" hidden>Forget this server</a>
+      </section>
+    </main>
+  </body>
+</html>
