@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
-use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+use tauri::menu::{
+    AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
+};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_notification::NotificationExt;
@@ -251,6 +253,65 @@ fn check_for_updates(app: tauri::AppHandle, interactive: bool) {
     });
 }
 
+// First-launch welcome notification. macOS has no up-front permission API we can
+// call (the plugin's desktop request_permission is a no-op), so posting one real
+// notification right after launch is how we get macOS to ask/register up front —
+// and it doubles as confirmation that notifications work.
+fn welcome_if_first_launch(app: &tauri::AppHandle) {
+    let Ok(dir) = app.path().app_config_dir() else {
+        return;
+    };
+    let flag = dir.join("notif-welcomed");
+    if flag.exists() {
+        return;
+    }
+    let _ = fs::create_dir_all(&dir);
+    let _ = app
+        .notification()
+        .builder()
+        .title("Agency OS")
+        .body("Notifications are on — you'll be alerted about new activity here.")
+        .show();
+    let _ = fs::write(flag, "1");
+}
+
+// Background watcher: post the first-launch welcome, then check GitHub for a newer
+// version on launch and every 6 hours. Each new version is downloaded/staged
+// (applies on next launch) and announced once via a native notification, so even
+// long-running installs don't miss an update.
+fn spawn_update_watcher(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        // Let the window settle before the first notification / permission prompt.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        welcome_if_first_launch(&app);
+
+        let mut announced: Option<String> = None;
+        loop {
+            if let Ok(updater) = app.updater() {
+                if let Ok(Some(update)) = tauri::async_runtime::block_on(updater.check()) {
+                    let version = update.version.clone();
+                    let staged = tauri::async_runtime::block_on(
+                        update.download_and_install(|_, _| {}, || {}),
+                    )
+                    .is_ok();
+                    if staged && announced.as_deref() != Some(version.as_str()) {
+                        let _ = app
+                            .notification()
+                            .builder()
+                            .title("Agency OS update ready")
+                            .body(format!(
+                                "Version {version} is downloaded — quit and reopen Agency OS to update."
+                            ))
+                            .show();
+                        announced = Some(version);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(6 * 60 * 60));
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -275,8 +336,20 @@ pub fn run() {
                 .build(app)?;
             let check_updates =
                 MenuItemBuilder::with_id("check-updates", "Check for Updates…").build(app)?;
+            let about = PredefinedMenuItem::about(
+                app,
+                Some("About Agency OS"),
+                Some(
+                    AboutMetadataBuilder::new()
+                        .name(Some("Agency OS"))
+                        .version(Some(app.package_info().version.to_string()))
+                        .build(),
+                ),
+            )?;
 
             let app_menu = SubmenuBuilder::new(app, "Agency OS")
+                .item(&about)
+                .separator()
                 .item(&change_server)
                 .item(&check_updates)
                 .separator()
@@ -406,8 +479,9 @@ pub fn run() {
                 })
                 .build()?;
 
-            // Silent background check on every launch; staged updates apply next open.
-            check_for_updates(app.handle().clone(), false);
+            // Welcome notification + background update watcher (checks on launch
+            // and every 6h, announcing staged updates so they aren't missed).
+            spawn_update_watcher(app.handle().clone());
 
             Ok(())
         })

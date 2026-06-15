@@ -52,9 +52,15 @@ pnpm tauri dev          # live window, no packaging
 ## Releases & auto-update
 
 Updates are served from **GitHub Releases** and verified with a signing key
-(public key baked into `tauri.conf.json`; private key in repo secrets). The app
-checks for updates silently on launch (staged updates apply on next open) and via
-**Agency OS → Check for Updates…** (installs + restarts immediately).
+(public key baked into `tauri.conf.json`; private key in repo secrets).
+
+- A background watcher checks **on launch and every 6 hours**. A newer version is
+  downloaded/staged (applies on next open) and announced **once** via a native
+  notification, so updates aren't missed.
+- **Agency OS → Check for Updates…** checks on demand and installs + restarts now.
+- The installed version is shown in **Agency OS → About Agency OS**.
+- On first launch the app posts a welcome notification (also how macOS registers
+  it for notifications up front).
 
 **Cutting a release:**
 
