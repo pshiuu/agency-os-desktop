@@ -25,8 +25,13 @@ point it at their own Agency OS server; end users never need build tools.
     (the SPA has no `/home` route);
   - **external links open in the system browser** — `LINK_INTERCEPT_JS` catches
     `target="_blank"` / `window.open(...)`, and `on_navigation` sends anything that
-    isn't an in-app `/agency-os` page (the ERPNext desk `/app/...`, file/PDF
-    downloads, websites) to the browser;
+    isn't an in-app `/agency-os` page (the ERPNext desk `/app/...`, other sites) to
+    the browser;
+  - **document previews & PDF exports stay in the app** — Frappe `/printview`
+    previews open in their own in-app window; a PDF export pops a native **Save As**
+    dialog and downloads to the chosen path (forced via a `download`-flagged link,
+    since WKWebView would otherwise just _display_ the PDF), with a "Preparing PDF…"
+    spinner shown until the file is saved;
   - **native macOS notifications** — `NOTIFY_JS` watches the SPA's
     `notifications.get_notifications` responses (refetched on the realtime
     `notification` socket event) and posts new unread items to Notification

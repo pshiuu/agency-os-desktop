@@ -1,8 +1,12 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use tauri::menu::{
     AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
 };
+use tauri::webview::DownloadEvent;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_notification::NotificationExt;
@@ -139,6 +143,224 @@ fn read_saved_url(app: &tauri::AppHandle) -> Option<String> {
 // login route when not authenticated), matching what the app uses after login.
 fn app_target(base: &str) -> String {
     format!("{}/agency-os/", base.trim_end_matches('/'))
+}
+
+// A monotonic id so each preview/download window gets a unique label.
+static DOC_WINDOW_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+// Frappe print/PDF endpoints the cockpit links to (proposal preview & PDF
+// export). These live outside `/agency-os`, so without special handling they
+// fall through to the system browser. We keep them in the app instead: the
+// `/printview` preview renders in a child window, and the `download_pdf` export
+// prompts for a save location and downloads there.
+fn looks_like_pdf_download(url: &tauri::Url) -> bool {
+    let path = url.path();
+    path.contains("print_format.download_pdf") || path.ends_with(".pdf")
+}
+
+fn looks_like_print_preview(url: &tauri::Url) -> bool {
+    url.path().starts_with("/printview")
+}
+
+fn is_document_url(url: &tauri::Url) -> bool {
+    looks_like_pdf_download(url) || looks_like_print_preview(url)
+}
+
+// Navigation rule shared by the document windows: stay within the server origin,
+// and hand anything else (external links) to the system browser.
+fn keep_in_origin(app: &tauri::AppHandle, host: &Option<String>, target: &tauri::Url) -> bool {
+    if target.scheme() == "tauri" {
+        return true;
+    }
+    match (host.as_deref(), target.host_str()) {
+        (Some(h), Some(uh)) if h == uh => true,
+        _ => {
+            let _ = app
+                .opener()
+                .open_url(target.as_str().to_string(), None::<&str>);
+            false
+        }
+    }
+}
+
+// Frappe names exported PDFs "<docname>.pdf"; the doc name rides on the `name`
+// query param. Used to pre-fill the Save As dialog.
+fn suggested_pdf_name(url: &tauri::Url) -> String {
+    url.query_pairs()
+        .find(|(k, _)| k == "name")
+        .map(|(_, v)| v.into_owned())
+        .filter(|s| !s.is_empty())
+        .map(|n| format!("{n}.pdf"))
+        .unwrap_or_else(|| "document.pdf".to_string())
+}
+
+// Save locations chosen via the Save As dialog, consumed (FIFO) by the main
+// window's download handler as each export arrives. `in_flight` carries the
+// filename to the completion notification (macOS omits the saved path on the
+// Finished event).
+#[derive(Default)]
+struct PendingDownloads {
+    queue: Mutex<VecDeque<PathBuf>>,
+    in_flight: Mutex<Option<String>>,
+}
+
+// Idempotent definition of a tiny "Preparing PDF…" toast with a spinner, shown
+// in the main window while an export is being generated and downloaded. Prepended
+// to the start/done scripts so it's always available regardless of page reloads.
+const DL_INDICATOR_JS: &str = r#"
+window.__agencyDl = window.__agencyDl || (function () {
+  var n = 0, timer = null;
+  function ensureToast() {
+    if (!document.getElementById('agency-dl-style')) {
+      var s = document.createElement('style');
+      s.id = 'agency-dl-style';
+      s.textContent =
+        '@keyframes agencyDlSpin{to{transform:rotate(360deg)}}' +
+        '#agency-dl-toast{position:fixed;right:20px;bottom:20px;z-index:2147483647;display:flex;align-items:center;gap:10px;padding:11px 15px;border-radius:10px;background:rgba(20,20,22,.92);color:#fff;font:13px/1.2 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;box-shadow:0 8px 28px rgba(0,0,0,.32);opacity:0;transition:opacity .2s;pointer-events:none}' +
+        '#agency-dl-toast .agency-dl-spin{width:14px;height:14px;border-radius:50%;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;animation:agencyDlSpin .7s linear infinite}';
+      (document.head || document.documentElement).appendChild(s);
+    }
+    var t = document.getElementById('agency-dl-toast');
+    if (!t) {
+      t = document.createElement('div');
+      t.id = 'agency-dl-toast';
+      t.innerHTML = '<span class="agency-dl-spin"></span><span class="agency-dl-label"></span>';
+      (document.body || document.documentElement).appendChild(t);
+    }
+    return t;
+  }
+  function render() {
+    var t = ensureToast();
+    t.querySelector('.agency-dl-label').textContent =
+      n > 1 ? ('Preparing ' + n + ' PDFs…') : 'Preparing PDF…';
+    requestAnimationFrame(function () { t.style.opacity = '1'; });
+  }
+  function hide() {
+    var t = document.getElementById('agency-dl-toast');
+    if (!t) return;
+    t.style.opacity = '0';
+    setTimeout(function () { if (n <= 0 && t.parentNode) t.parentNode.removeChild(t); }, 250);
+  }
+  return {
+    inc: function () {
+      n++;
+      render();
+      if (timer) clearTimeout(timer);
+      // Safety net: clear the spinner even if no finish event ever arrives.
+      timer = setTimeout(function () { n = 0; hide(); }, 120000);
+    },
+    dec: function () {
+      n = Math.max(0, n - 1);
+      if (n <= 0) {
+        if (timer) { clearTimeout(timer); timer = null; }
+        hide();
+      } else {
+        render();
+      }
+    }
+  };
+})();
+"#;
+
+// Show the spinner, then force a real download in the main window. WKWebView
+// happily *displays* PDFs, so wry only treats a response as a download when the
+// navigation is flagged `shouldPerformDownload` — which an anchor carrying a
+// `download` attribute sets, regardless of content type. Clicking it downloads
+// without replacing the page.
+fn download_start_js(url: &str) -> String {
+    let url_lit = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"{define}
+try {{ window.__agencyDl.inc(); }} catch (e) {{}}
+(function () {{
+  try {{
+    var a = document.createElement('a');
+    a.href = {url};
+    a.download = '';
+    a.rel = 'noopener';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () {{ a.remove(); }}, 0);
+  }} catch (e) {{}}
+}})();"#,
+        define = DL_INDICATOR_JS,
+        url = url_lit
+    )
+}
+
+// Hide the spinner once a download finishes (fires on success and failure).
+fn download_done_js() -> String {
+    format!(
+        "{define}\ntry {{ window.__agencyDl.dec(); }} catch (e) {{}}",
+        define = DL_INDICATOR_JS
+    )
+}
+
+// Route a print preview or PDF export into the app instead of the browser.
+fn open_document_window(app: &tauri::AppHandle, url: tauri::Url) {
+    if looks_like_pdf_download(&url) {
+        prompt_and_download_pdf(app, url);
+    } else {
+        // Window creation is deferred to the main thread because this is invoked
+        // from inside the WKWebView navigation callback.
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || build_preview_window(&handle, url));
+    }
+}
+
+// Ask the user where to save the PDF, then download it there. The dialog is
+// shown up front (not from the download callback, where a modal would deadlock
+// the main thread); once a path is chosen we queue it and kick off a real
+// download in the logged-in main window via `trigger_download_js`.
+fn prompt_and_download_pdf(app: &tauri::AppHandle, url: tauri::Url) {
+    let handle = app.clone();
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("Save PDF")
+        .set_file_name(suggested_pdf_name(&url))
+        .add_filter("PDF", &["pdf"]);
+    if let Ok(dir) = app.path().download_dir() {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.save_file(move |chosen| {
+        let Some(target) = chosen.and_then(|p| p.into_path().ok()) else {
+            return; // cancelled, or no real path
+        };
+        if let Some(state) = handle.try_state::<PendingDownloads>() {
+            state.queue.lock().unwrap().push_back(target);
+        }
+        let app = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            if let Some(main) = app.get_webview_window("main") {
+                let _ = main.eval(download_start_js(url.as_str()));
+            }
+        });
+    });
+}
+
+// A visible window that renders the formatted `/printview` HTML for reading and
+// printing. The main cockpit window stays untouched behind it.
+fn build_preview_window(app: &tauri::AppHandle, url: tauri::Url) {
+    let host = url.host_str().map(|s| s.to_string());
+    let fallback_url = url.as_str().to_string();
+    let seq = DOC_WINDOW_SEQ.fetch_add(1, Ordering::Relaxed);
+    let label = format!("doc-{seq}");
+
+    let nav_app = app.clone();
+
+    let built = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
+        .title("Preview")
+        .inner_size(900.0, 1160.0)
+        .min_inner_size(480.0, 480.0)
+        .center()
+        .on_navigation(move |u| keep_in_origin(&nav_app, &host, u))
+        .build();
+
+    if built.is_err() {
+        let _ = app.opener().open_url(fallback_url, None::<&str>);
+    }
 }
 
 #[tauri::command]
@@ -415,6 +637,9 @@ pub fn run() {
             _ => {}
         })
         .setup(|app| {
+            // Holds Save As destinations until the matching download arrives.
+            app.manage(PendingDownloads::default());
+
             // Saved server → load it directly as the window's initial content
             // (the reliable way to show remote content). Otherwise show the
             // local connect screen.
@@ -454,28 +679,86 @@ pub fn run() {
                         }
                         return false;
                     }
-                    // Sentinel emitted by LINK_INTERCEPT_JS: open the wrapped URL
-                    // in the system browser, and cancel the in-app navigation.
+                    // Sentinel emitted by LINK_INTERCEPT_JS for `_blank` links and
+                    // `window.open(...)`. A print preview or PDF export stays in the
+                    // app (own window / saved file); everything else opens in the
+                    // system browser. Either way the cockpit doesn't navigate.
                     if url.host_str() == Some("ext.agencyos.invalid") {
                         if let Some(target) = url
                             .query_pairs()
                             .find(|(k, _)| k.as_ref() == "u")
                             .map(|(_, v)| v.into_owned())
                         {
-                            let _ = handle.opener().open_url(target, None::<&str>);
+                            match tauri::Url::parse(&target) {
+                                Ok(parsed) if is_document_url(&parsed) => {
+                                    open_document_window(&handle, parsed);
+                                }
+                                _ => {
+                                    let _ = handle.opener().open_url(target, None::<&str>);
+                                }
+                            }
                         }
                         return false;
                     }
                     // Allow only the app's own pages (the SPA under /agency-os and
-                    // the local connect screen). Anything else — the ERPNext desk
-                    // at /app, file downloads, other sites — opens in the browser.
+                    // the local connect screen). Print previews and PDF exports are
+                    // kept inside the app; anything else — the ERPNext desk at /app,
+                    // other sites — opens in the system browser.
                     if url.scheme() == "tauri" || url.path().starts_with("/agency-os") {
                         return true;
+                    }
+                    if is_document_url(url) {
+                        open_document_window(&handle, url.clone());
+                        return false;
                     }
                     let _ = handle
                         .opener()
                         .open_url(url.as_str().to_string(), None::<&str>);
                     false
+                })
+                // Save PDF exports to the location chosen in the Save As dialog
+                // (see `prompt_and_download_pdf` / `trigger_download_js`); fall
+                // back to Downloads for any download we didn't initiate.
+                .on_download(|webview, event| match event {
+                    DownloadEvent::Requested { url, destination } => {
+                        let chosen = webview
+                            .try_state::<PendingDownloads>()
+                            .and_then(|s| s.queue.lock().unwrap().pop_front());
+                        let target = chosen.unwrap_or_else(|| {
+                            let name = suggested_pdf_name(&url);
+                            match webview.path().download_dir() {
+                                Ok(dir) => dir.join(name),
+                                Err(_) => PathBuf::from(name),
+                            }
+                        });
+                        if let Some(state) = webview.try_state::<PendingDownloads>() {
+                            *state.in_flight.lock().unwrap() = target
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| s.to_string());
+                        }
+                        *destination = target;
+                        true
+                    }
+                    DownloadEvent::Finished { success, .. } => {
+                        // Clear the "Preparing PDF…" spinner (fires on success or
+                        // failure).
+                        let _ = webview.eval(download_done_js());
+                        if success {
+                            let name = webview
+                                .try_state::<PendingDownloads>()
+                                .and_then(|s| s.in_flight.lock().unwrap().clone())
+                                .unwrap_or_else(|| "PDF".to_string());
+                            let _ = webview
+                                .notification()
+                                .builder()
+                                .title("Download complete")
+                                .body(format!("Saved {name}"))
+                                .show();
+                        }
+                        true
+                    }
+                    _ => true,
                 })
                 .build()?;
 
