@@ -37,6 +37,18 @@ point it at their own Agency OS server; end users never need build tools.
     `notification` socket event) and posts new unread items to Notification
     Center via the sentinel → `tauri-plugin-notification`. No SPA changes needed;
     the first notification may prompt for permission.
+  - **video meetings run in-app** — the cockpit's LiveKit video calls
+    (`/agency-os/meet/…`, guests `/agency-os/join/…`) work natively, so calls no
+    longer have to be taken in a browser. Three things make that work: wry grants
+    the WebView's WebRTC camera/mic permission automatically; `src-tauri/Info.plist`
+    supplies the `NSCameraUsageDescription` / `NSMicrophoneUsageDescription` strings
+    macOS requires before any app may touch the camera or mic (without them macOS
+    **crashes** the app on first use); and a scheduled meeting's `target="_blank"`
+    **Join** link — which would otherwise fall through to the system browser — is
+    recognised and opened in its own in-app **call window** (full viewport, cockpit
+    left untouched behind it; repeat clicks focus the same window). Instant
+    meetings and answering an incoming call navigate in-place, as before. Screen
+    sharing uses `getDisplayMedia` (macOS 13+; prompts once for Screen Recording).
   - **auto-updates** from GitHub Releases (see below).
 
 ## Build a `.app` + `.dmg` locally (for dev/testing)
@@ -108,3 +120,12 @@ xattr -dr com.apple.quarantine "/Applications/Agency OS.app"
 To remove the warning entirely, sign + notarize with an Apple Developer ID
 (~$99/yr): set the identity under `bundle.macOS` in `tauri.conf.json` plus the
 notarization secrets, and the CI build will sign automatically.
+
+> Camera/microphone under the hardened runtime: notarized builds run with the
+> hardened runtime, which **denies** camera and mic access unless the app is
+> signed with the matching entitlements. Those are already wired up —
+> `src-tauri/Entitlements.plist` (`com.apple.security.device.camera` +
+> `….audio-input`) is referenced from `bundle.macOS.entitlements`. Unsigned builds
+> ignore it (a no-op today); the moment you add a signing identity it takes effect,
+> so video meetings keep working on signed/notarized releases. `minimumSystemVersion`
+> is `12.0` — the floor for WKWebView's `getUserMedia`.

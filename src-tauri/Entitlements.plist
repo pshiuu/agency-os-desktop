@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Applied only when the build is code-signed (a signing identity is configured).
+  Unsigned/ad-hoc builds ignore this file, so it is a no-op for the current
+  release pipeline and becomes active the moment a Developer ID + hardened
+  runtime is enabled for notarization.
+
+  Under the hardened runtime, camera and microphone access is denied unless these
+  resource-access entitlements are present — so they must ship the day this app
+  is notarized, or meetings would break for signed builds.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.camera</key>
+	<true/>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

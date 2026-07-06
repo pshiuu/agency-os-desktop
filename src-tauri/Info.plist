@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the app's generated Contents/Info.plist by Tauri (bundler for
+  `tauri build`, and embedded into the dev binary by tauri-build for `tauri dev`).
+
+  These usage descriptions are REQUIRED for video meetings: macOS terminates any
+  app that touches the camera or microphone without them. WKWebView (via wry)
+  already grants the page's getUserMedia request; the first time a call uses the
+  camera/mic, macOS shows the TCC prompt with the strings below.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Agency OS uses your camera so others can see you in video meetings.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Agency OS uses your microphone so others can hear you in video meetings and calls.</string>
+</dict>
+</plist>

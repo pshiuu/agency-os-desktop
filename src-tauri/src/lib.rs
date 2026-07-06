@@ -166,6 +166,18 @@ fn is_document_url(url: &tauri::Url) -> bool {
     looks_like_pdf_download(url) || looks_like_print_preview(url)
 }
 
+// Embedded Agency OS video-call routes: the authenticated room (`/meet/<name>`)
+// and the guest join page (`/join/<name>`), both under the SPA base `/agency-os`
+// (see ROOM_PATH_PREFIX in agency_os/api/meet.py and the SPA router). A scheduled
+// meeting's "Join" button is a `target="_blank"` link, so without this it would
+// fall through to the system browser — the exact thing the desktop app exists to
+// avoid. We keep the call inside the app, in its own window (below). External
+// meeting_urls (Zoom/Meet/etc.) don't match and still open in the browser.
+fn looks_like_meeting_room(url: &tauri::Url) -> bool {
+    let path = url.path();
+    path.starts_with("/agency-os/meet/") || path.starts_with("/agency-os/join/")
+}
+
 // Navigation rule shared by the document windows: stay within the server origin,
 // and hand anything else (external links) to the system browser.
 fn keep_in_origin(app: &tauri::AppHandle, host: &Option<String>, target: &tauri::Url) -> bool {
@@ -356,6 +368,82 @@ fn build_preview_window(app: &tauri::AppHandle, url: tauri::Url) {
         .min_inner_size(480.0, 480.0)
         .center()
         .on_navigation(move |u| keep_in_origin(&nav_app, &host, u))
+        .build();
+
+    if built.is_err() {
+        let _ = app.opener().open_url(fallback_url, None::<&str>);
+    }
+}
+
+// A stable window label per meeting, so clicking "Join" again focuses the same
+// call window instead of stacking duplicates. Tauri labels only allow
+// `[a-zA-Z0-9-/:_]`, so the meeting id (the last path segment) is sanitised.
+fn meeting_window_label(url: &tauri::Url) -> String {
+    let id: String = url
+        .path()
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("call")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("call-{id}")
+}
+
+// Navigation rule for a call window. `_blank` links / `window.open` inside the
+// room (e.g. a guest invite link the host shares) go to the system browser via
+// the LINK_INTERCEPT_JS sentinel; same-origin pages stay in the window; anything
+// else external opens in the browser. We never spawn another call window from
+// here, so a room can't recurse into new windows.
+fn meeting_window_nav(app: &tauri::AppHandle, host: &Option<String>, target: &tauri::Url) -> bool {
+    if target.host_str() == Some("ext.agencyos.invalid") {
+        if let Some(u) = target
+            .query_pairs()
+            .find(|(k, _)| k == "u")
+            .map(|(_, v)| v.into_owned())
+        {
+            let _ = app.opener().open_url(u, None::<&str>);
+        }
+        return false;
+    }
+    keep_in_origin(app, host, target)
+}
+
+// Open an embedded meeting room in its own in-app window (full viewport, matching
+// the SPA's own `/meet` route intent) so the cockpit window stays where it was.
+// Cookies are shared across the app's windows, so the call is already
+// authenticated — same as the print-preview window.
+fn open_meeting_window(app: &tauri::AppHandle, url: tauri::Url) {
+    // Window creation must run on the main thread (this is called from inside the
+    // WKWebView navigation callback).
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || build_meeting_window(&handle, url));
+}
+
+fn build_meeting_window(app: &tauri::AppHandle, url: tauri::Url) {
+    let label = meeting_window_label(&url);
+    if let Some(win) = app.get_webview_window(&label) {
+        let _ = win.set_focus();
+        return;
+    }
+
+    let host = url.host_str().map(|s| s.to_string());
+    let fallback_url = url.as_str().to_string();
+    let nav_app = app.clone();
+
+    let built = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
+        .title("Agency OS — Meeting")
+        .inner_size(1200.0, 820.0)
+        .min_inner_size(720.0, 520.0)
+        .center()
+        .initialization_script(LINK_INTERCEPT_JS)
+        .on_navigation(move |u| meeting_window_nav(&nav_app, &host, u))
         .build();
 
     if built.is_err() {
@@ -680,9 +768,10 @@ pub fn run() {
                         return false;
                     }
                     // Sentinel emitted by LINK_INTERCEPT_JS for `_blank` links and
-                    // `window.open(...)`. A print preview or PDF export stays in the
-                    // app (own window / saved file); everything else opens in the
-                    // system browser. Either way the cockpit doesn't navigate.
+                    // `window.open(...)`. A meeting room stays in the app (own call
+                    // window); a print preview or PDF export stays in the app (own
+                    // window / saved file); everything else opens in the system
+                    // browser. Either way the cockpit doesn't navigate.
                     if url.host_str() == Some("ext.agencyos.invalid") {
                         if let Some(target) = url
                             .query_pairs()
@@ -690,6 +779,9 @@ pub fn run() {
                             .map(|(_, v)| v.into_owned())
                         {
                             match tauri::Url::parse(&target) {
+                                Ok(parsed) if looks_like_meeting_room(&parsed) => {
+                                    open_meeting_window(&handle, parsed);
+                                }
                                 Ok(parsed) if is_document_url(&parsed) => {
                                     open_document_window(&handle, parsed);
                                 }
