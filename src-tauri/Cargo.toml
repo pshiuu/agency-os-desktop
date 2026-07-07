@@ -18,7 +18,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
+# `macos-private-api` compiles wry with its `fullscreen` feature, which flips the
+# private `fullScreenEnabled` WKPreferences key — without it, WKWebView rejects
+# element.requestFullscreen() (used by the meeting room's full-screen button).
+tauri = { version = "2", features = ["devtools", "macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
